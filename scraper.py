@@ -3,44 +3,221 @@ import os
 import sys
 import re
 import time
+import random
 from datetime import datetime
+import urllib.request
+import urllib.error
 
-# Playwright use karega kyunki JS render karna hai
-from playwright.sync_api import sync_playwright
+# Selenium with proxy support
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 class TempMailScraper:
     def __init__(self):
         self.base_url = "https://tempmail.ninja"
         self.email = None
-        self.page = None
-        self.browser = None
+        self.driver = None
         
+        # 🔥 PROXY CONFIGURATION - YEH ENV VARIABLES SE AAYEGA
+        self.proxy_list = self._load_proxies()
+        self.current_proxy = None
+        
+    def _load_proxies(self):
+        """Proxies load karega environment se"""
+        proxies = []
+        
+        # Format: http://user:pass@host:port ya http://host:port
+        proxy_env = os.getenv('PROXIES', '')
+        
+        if proxy_env:
+            # Comma separated proxies
+            proxies = [p.strip() for p in proxy_env.split(',') if p.strip()]
+        
+        # Agar single proxy hai to bhi handle karega
+        http_proxy = os.getenv('HTTP_PROXY', '')
+        https_proxy = os.getenv('HTTPS_PROXY', '')
+        socks_proxy = os.getenv('SOCKS5_PROXY', '')
+        
+        if http_proxy and http_proxy not in proxies:
+            proxies.append(http_proxy)
+        if https_proxy and https_proxy not in proxies:
+            proxies.append(https_proxy)
+        if socks_proxy and socks_proxy not in proxies:
+            proxies.append(socks_proxy)
+        
+        print(f"Loaded {len(proxies)} proxies", file=sys.stderr)
+        return proxies
+    
+    def _get_random_proxy(self):
+        """Random proxy select karega"""
+        if not self.proxy_list:
+            return None
+        return random.choice(self.proxy_list)
+    
+    def _setup_proxy(self, chrome_options, proxy_url):
+        """Chrome mein proxy configure karega"""
+        if not proxy_url:
+            return
+        
+        self.current_proxy = proxy_url
+        print(f"Using proxy: {proxy_url}", file=sys.stderr)
+        
+        # Proxy format handle karega
+        if proxy_url.startswith('socks5://'):
+            # SOCKS5 proxy
+            chrome_options.add_argument(f'--proxy-server={proxy_url}')
+            # SOCKS5 ke liye alag handling
+            chrome_options.add_argument(f'--socks-proxy={proxy_url.replace("socks5://", "")}')
+        else:
+            # HTTP/HTTPS proxy
+            chrome_options.add_argument(f'--proxy-server={proxy_url}')
+        
+        # Proxy authentication ke liye
+        if '@' in proxy_url:
+            # user:pass@host:port format
+            # Chrome mein extension ki zaroorat padti hai auth ke liye
+            pass  # Agar auth wala proxy hai to neeche extension use karega
+    
+    def _create_proxy_auth_extension(self, proxy):
+        """Proxy authentication ke liye Chrome extension"""
+        if not proxy or '@' not in proxy:
+            return None
+        
+        # Parse proxy URL
+        # Format: http://user:pass@host:port
+        match = re.match(r'^(?:http|https|socks5)://([^:]+):([^@]+)@(.+):(\d+)$', proxy)
+        if not match:
+            return None
+        
+        user, pwd, host, port = match.groups()
+        
+        # Manifest JSON
+        manifest_json = """
+        {
+            "version": "1.0.0",
+            "manifest_version": 2,
+            "name": "Chrome Proxy",
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "<all_urls>",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            },
+            "minimum_chrome_version":"22.0.0"
+        }
+        """
+        
+        # Background JS
+        background_js = """
+        var config = {
+                mode: "fixed_servers",
+                rules: {
+                  singleProxy: {
+                    scheme: "http",
+                    host: "%s",
+                    port: parseInt(%s)
+                  },
+                  bypassList: ["localhost"]
+                }
+              };
+
+        chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+
+        function callbackFn(details) {
+            return {
+                authCredentials: {
+                    username: "%s",
+                    password: "%s"
+                }
+            };
+        }
+
+        chrome.webRequest.onAuthRequired.addListener(
+                    callbackFn,
+                    {urls: ["<all_urls>"]},
+                    ['blocking']
+        );
+        """ % (host, port, user, pwd)
+        
+        # Extension create karega
+        import zipfile
+        pluginfile = 'proxy_auth_plugin.zip'
+        
+        with zipfile.ZipFile(pluginfile, 'w') as zp:
+            zp.writestr("manifest.json", manifest_json)
+            zp.writestr("background.js", background_js)
+        
+        return pluginfile
+    
     def start_browser(self):
-        """Headless browser start karega"""
+        """Proxy ke saath headless Chrome start karega"""
         try:
-            self.playwright = sync_playwright().start()
+            chrome_options = Options()
             
-            # Headless browser launch karega
-            self.browser = self.playwright.chromium.launch(
-                headless=True,  # True rakh production mein
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-gpu'
-                ]
-            )
+            # Headless mode
+            chrome_options.add_argument('--headless=new')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--window-size=1920,1080')
             
-            # Context with realistic viewport
-            self.context = self.browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
+            # Stealth options
+            chrome_options.add_argument('--disable-extensions')
+            chrome_options.add_argument('--disable-plugins')
+            chrome_options.add_argument('--disable-images')
+            chrome_options.add_argument('--disable-javascript')  # JS disable mat karna, email JS se aata hai
             
-            self.page = self.context.new_page()
+            # Realistic user agent
+            chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            
+            # Disable automation flags
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            
+            # 🔥 PROXY SETUP
+            proxy = self._get_random_proxy()
+            if proxy:
+                # Agar proxy mein auth hai to extension use karega
+                if '@' in proxy:
+                    extension = self._create_proxy_auth_extension(proxy)
+                    if extension:
+                        chrome_options.add_extension(extension)
+                else:
+                    self._setup_proxy(chrome_options, proxy)
+            else:
+                print("WARNING: No proxy configured! Cloudflare may block.", file=sys.stderr)
+            
+            # Chrome start karega
+            self.driver = webdriver.Chrome(options=chrome_options)
+            
+            # Stealth mode execute karega
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                    window.chrome = { runtime: {} };
+                '''
+            })
+            
             return True
             
         except Exception as e:
@@ -48,78 +225,98 @@ class TempMailScraper:
             return False
     
     def get_email(self):
-        """TempMail.Ninja se email fetch karega with proper waiting"""
-        try:
-            print("Opening TempMail.Ninja...", file=sys.stderr)
-            
-            # Page load karega with timeout
-            self.page.goto(self.base_url, wait_until='networkidle', timeout=60000)
-            
-            # Wait for page to fully load
-            print("Waiting for page to load completely...", file=sys.stderr)
-            self.page.wait_for_load_state('domcontentloaded')
-            self.page.wait_for_load_state('networkidle')
-            
-            # Additional wait kyunki React app hai
-            time.sleep(3)
-            
-            # Multiple attempts to find email
-            max_attempts = 10
-            for attempt in range(max_attempts):
-                print(f"Attempt {attempt + 1}/{max_attempts} to find email...", file=sys.stderr)
+        """TempMail.Ninja se email fetch karega with retry"""
+        max_retries = 3
+        
+        for retry in range(max_retries):
+            try:
+                print(f"\n🚀 Attempt {retry + 1}/{max_retries}", file=sys.stderr)
                 
-                # Try multiple selectors jo tu ne HTML mein diye
-                selectors = [
-                    'span.main-email',
-                    '[class*="main-email"]',
-                    '[class*="email"]',
-                    'span[class*="email"]',
-                    'div[class*="email"]',
-                    '[data-v-01643e1e] span',  # Vue component se
-                ]
+                # Fresh browser start har retry pe
+                if self.driver:
+                    self.driver.quit()
                 
-                for selector in selectors:
-                    try:
-                        # Element visible ho raha hai ki nahi
-                        self.page.wait_for_selector(selector, timeout=5000)
-                        element = self.page.locator(selector).first
-                        
-                        if element.is_visible():
-                            text = element.inner_text().strip()
-                            print(f"Found text with selector '{selector}': {text}", file=sys.stderr)
-                            
-                            # Email validation
-                            if re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', text):
-                                self.email = text
-                                print(f"✅ Valid email found: {self.email}", file=sys.stderr)
-                                return {
-                                    'email': self.email,
-                                    'timestamp': datetime.now().isoformat(),
-                                    'status': 'active',
-                                    'source': 'tempmail.ninja',
-                                    'attempts': attempt + 1
-                                }
-                    except:
+                if not self.start_browser():
+                    continue
+                
+                print("Opening TempMail.Ninja...", file=sys.stderr)
+                self.driver.get(self.base_url)
+                
+                # Wait for Cloudflare challenge solve hone de
+                print("Waiting for Cloudflare/JS challenge...", file=sys.stderr)
+                time.sleep(8)  # Important: Cloudflare solve hone tak wait
+                
+                # Check agar block hua hai
+                if "blocked" in self.driver.page_source.lower() or "cloudflare" in self.driver.page_source.lower():
+                    print("⚠️ Cloudflare block detected, trying next proxy...", file=sys.stderr)
+                    if retry < max_retries - 1:
                         continue
+                    else:
+                        return {
+                            'error': 'Cloudflare blocked all proxies',
+                            'status': 'failed',
+                            'timestamp': datetime.now().isoformat()
+                        }
                 
-                # Agar email nahi mila, page reload kar ya wait kar
-                if attempt < max_attempts - 1:
+                # Page load wait
+                time.sleep(3)
+                
+                # Email find karega
+                result = self._extract_email()
+                if result.get('status') == 'active':
+                    return result
+                
+                # Agar nahi mila to retry
+                if retry < max_retries - 1:
+                    print("Email not found, retrying with new proxy...", file=sys.stderr)
                     time.sleep(2)
-                    # Try clicking refresh/generate button if exists
-                    try:
-                        refresh_btn = self.page.locator('button:has-text("refresh"), button:has-text("new"), [class*="refresh"]').first
-                        if refresh_btn.is_visible():
-                            refresh_btn.click()
-                            time.sleep(2)
-                    except:
-                        pass
+                
+            except Exception as e:
+                print(f"Error in attempt {retry + 1}: {e}", file=sys.stderr)
+                if retry < max_retries - 1:
+                    time.sleep(3)
+        
+        # All retries failed
+        return {
+            'error': 'Failed after all retries',
+            'status': 'failed',
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    def _extract_email(self):
+        """Email extract karega page se"""
+        try:
+            # Multiple selectors try karega
+            selectors = [
+                'span.main-email',
+                '[class*="main-email"]',
+                '[class*="email"]',
+                'span[class*="email"]',
+                'div[class*="email"]',
+            ]
             
-            # Fallback: JavaScript se email nikaalne ki koshish
+            for selector in selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        text = element.text.strip()
+                        if re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', text):
+                            self.email = text
+                            print(f"✅ Email found: {self.email}", file=sys.stderr)
+                            return {
+                                'email': self.email,
+                                'timestamp': datetime.now().isoformat(),
+                                'status': 'active',
+                                'source': 'tempmail.ninja',
+                                'proxy_used': self.current_proxy
+                            }
+                except:
+                    continue
+            
+            # JavaScript se try karega
             print("Trying JavaScript extraction...", file=sys.stderr)
-            js_email = self.page.evaluate('''() => {
-                // Nuxt app se data nikaalne ki koshish
+            js_result = self.driver.execute_script('''
                 if (window.__NUXT__ && window.__NUXT__.state) {
-                    // State mein email dhoondhega
                     const state = window.__NUXT__.state;
                     for (let key in state) {
                         if (typeof state[key] === 'string' && state[key].includes('@')) {
@@ -127,58 +324,35 @@ class TempMailScraper:
                         }
                     }
                 }
-                // DOM se dhoondhega
                 const spans = document.querySelectorAll('span');
-                for (let span of spans) {
-                    if (span.innerText && span.innerText.includes('@')) {
-                        return span.innerText.trim();
-                    }
+                for (let s of spans) {
+                    if (s.innerText && s.innerText.includes('@')) return s.innerText.trim();
                 }
                 return null;
-            }''')
+            ''')
             
-            if js_email and re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', js_email):
-                self.email = js_email
+            if js_result and re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', js_result):
+                self.email = js_result
                 return {
                     'email': self.email,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'active',
                     'source': 'tempmail.ninja',
-                    'method': 'javascript'
+                    'method': 'javascript',
+                    'proxy_used': self.current_proxy
                 }
             
-            # Screenshot for debugging
-            self.page.screenshot(path='debug_screenshot.png')
-            print("Screenshot saved for debugging", file=sys.stderr)
-            
-            # Page source for debugging
-            html_content = self.page.content()
-            print(f"Page HTML length: {len(html_content)}", file=sys.stderr)
-            
-            # Last resort: regex se email nikaalne ki koshish
-            emails_found = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', html_content)
-            if emails_found:
-                # Filter out common false positives
-                valid_emails = [e for e in emails_found if not any(x in e.lower() for x in ['example', 'test@', 'user@'])]
-                if valid_emails:
-                    self.email = valid_emails[0]
-                    return {
-                        'email': self.email,
-                        'timestamp': datetime.now().isoformat(),
-                        'status': 'active',
-                        'source': 'tempmail.ninja',
-                        'method': 'regex_fallback'
-                    }
+            # Screenshot for debug
+            self.driver.save_screenshot('debug_screenshot.png')
             
             return {
-                'error': 'Email not found after all attempts',
+                'error': 'Email not found on page',
                 'status': 'failed',
                 'timestamp': datetime.now().isoformat(),
-                'html_length': len(html_content)
+                'page_title': self.driver.title
             }
             
         except Exception as e:
-            print(f"Error in get_email: {e}", file=sys.stderr)
             return {
                 'error': str(e),
                 'status': 'failed',
@@ -189,60 +363,42 @@ class TempMailScraper:
         """Inbox check karega OTP ke liye"""
         if not email:
             email = self.email
-            
+        
         if not email:
             return {'error': 'No email provided'}
         
         try:
-            print(f"Checking inbox for {email}...", file=sys.stderr)
-            
-            # Inbox page par jayega
             inbox_url = f"{self.base_url}/inbox/{email}"
-            self.page.goto(inbox_url, wait_until='networkidle', timeout=30000)
+            self.driver.get(inbox_url)
+            time.sleep(5)
             
-            # Wait for messages to load
-            time.sleep(3)
+            # Messages find karega
+            messages = self.driver.find_elements(By.CSS_SELECTOR, '[class*="message"], tr')
             
-            # Messages dhoondhega
-            messages = self.page.evaluate('''() => {
-                const msgs = [];
-                const rows = document.querySelectorAll('[class*="message"], [class*="email-row"], tr');
-                rows.forEach(row => {
-                    const subject = row.querySelector('[class*="subject"], td:nth-child(3)')?.innerText || '';
-                    const from = row.querySelector('[class*="from"], td:nth-child(2)')?.innerText || '';
-                    const body = row.innerText || '';
-                    msgs.push({subject, from, body});
-                });
-                return msgs;
-            }''')
-            
-            print(f"Found {len(messages)} messages", file=sys.stderr)
-            
-            # OTP check karega
             for msg in messages:
-                full_text = f"{msg.get('subject', '')} {msg.get('body', '')}"
-                
-                # OTP patterns
-                patterns = [
-                    r'\b\d{4,8}\b',
-                    r'(?:otp|code|verify|confirmation)[:\s]+(\d{4,8})',
-                ]
-                
-                for pattern in patterns:
-                    match = re.search(pattern, full_text, re.IGNORECASE)
-                    if match:
-                        otp = match.group(1) if match.groups() else match.group(0)
-                        return {
-                            'otp_found': True,
-                            'otp': otp,
-                            'sender': msg.get('from', ''),
-                            'subject': msg.get('subject', ''),
-                            'timestamp': datetime.now().isoformat()
-                        }
+                try:
+                    text = msg.text
+                    
+                    # OTP patterns
+                    patterns = [
+                        r'\b\d{4,8}\b',
+                        r'(?:otp|code|verify|confirmation)[:\s]+(\d{4,8})',
+                    ]
+                    
+                    for pattern in patterns:
+                        match = re.search(pattern, text, re.IGNORECASE)
+                        if match:
+                            otp = match.group(1) if match.groups() else match.group(0)
+                            return {
+                                'otp_found': True,
+                                'otp': otp,
+                                'timestamp': datetime.now().isoformat()
+                            }
+                except:
+                    continue
             
             return {
                 'otp_found': False,
-                'messages_count': len(messages),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -253,17 +409,15 @@ class TempMailScraper:
             }
     
     def close(self):
-        """Browser close karega"""
+        """Browser close"""
         try:
-            if self.browser:
-                self.browser.close()
-            if self.playwright:
-                self.playwright.stop()
+            if self.driver:
+                self.driver.quit()
         except:
             pass
 
 def save_to_firebase(data):
-    """Firebase mein data save karega"""
+    """Firebase mein save karega"""
     try:
         import firebase_admin
         from firebase_admin import credentials, db
@@ -272,33 +426,25 @@ def save_to_firebase(data):
         firebase_token = os.getenv('FIREBASE_TOKEN')
         
         if not firebase_url or not firebase_token:
-            print("Firebase credentials not found, saving locally", file=sys.stderr)
             with open('email_result.json', 'w') as f:
                 json.dump(data, f, indent=2)
             return True
         
-        # Parse token
         if isinstance(firebase_token, str):
-            import json as json_mod
-            cred_info = json_mod.loads(firebase_token)
+            cred_info = json.loads(firebase_token)
         else:
             cred_info = firebase_token
         
-        # Initialize
         if not firebase_admin._apps:
             cred = credentials.Certificate(cred_info)
-            firebase_admin.initialize_app(cred, {
-                'databaseURL': firebase_url
-            })
+            firebase_admin.initialize_app(cred, {'databaseURL': firebase_url})
         
         ref = db.reference('/emails')
-        new_ref = ref.push(data)
-        print(f"Saved to Firebase with key: {new_ref.key}", file=sys.stderr)
+        ref.push(data)
         return True
         
     except Exception as e:
-        print(f"Firebase save error: {e}", file=sys.stderr)
-        # Fallback: local save
+        print(f"Firebase error: {e}", file=sys.stderr)
         with open('email_result.json', 'w') as f:
             json.dump(data, f, indent=2)
         return False
@@ -308,21 +454,11 @@ def main():
     
     scraper = TempMailScraper()
     
-    if not scraper.start_browser():
-        print(json.dumps({
-            'error': 'Failed to start browser',
-            'status': 'failed'
-        }))
-        sys.exit(1)
-    
     try:
         if action == 'check_otp':
             result = scraper.check_otp()
         else:
-            # Default: create email
             result = scraper.get_email()
-            
-            # Save to Firebase
             if result.get('status') == 'active':
                 save_to_firebase(result)
         

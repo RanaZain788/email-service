@@ -1,7 +1,6 @@
 name: Email Scraper Automation
 
 on:
-  # Manual trigger (Buy button click ke liye)
   workflow_dispatch:
     inputs:
       action:
@@ -13,26 +12,28 @@ on:
           - create_email
           - check_otp
           - cancel_workflow
-  
-  # Schedule bhi rakh sakta hai (optional)
-  # schedule:
-  #   - cron: '*/5 * * * *'
+      email_id:
+        description: 'Email ID (for OTP check)'
+        required: false
+        default: ''
 
 jobs:
   scrape-email:
     runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'cancel_workflow'
     
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4  # ✅ Updated to v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # ✅ Updated to v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
       
       - name: Install Dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
       
       - name: Run Scraper - Create Email
@@ -42,46 +43,71 @@ jobs:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
         run: |
           python scraper.py > email_result.json
-          echo "EMAIL_RESULT=$(cat email_result.json)" >> $GITHUB_ENV
+          cat email_result.json
       
-      - name: Check OTP
+      - name: Run Scraper - Check OTP
         if: github.event.inputs.action == 'check_otp'
         env:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          EMAIL_ID: ${{ github.event.inputs.email_id }}
         run: |
-          python -c "
-          import requests, json, os, time
-          from bs4 import BeautifulSoup
-          
-          # Firebase se latest email lega
-          # Ye part tu customize karega apne logic se
-          print('Checking OTP...')
-          "
+          python check_otp.py
       
       - name: Upload Results
         if: github.event.inputs.action == 'create_email'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # ✅ FIXED: v3 → v4
         with:
           name: email-data
           path: email_result.json
+          retention-days: 1
       
       - name: Save to Firebase
         if: github.event.inputs.action == 'create_email'
         run: |
-          # Firebase mein data push karega via REST API
-          curl -X POST \
-            "${{ secrets.FIREBASE_URL }}/emails.json?auth=${{ secrets.FIREBASE_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d @email_result.json || true
+          python -c "
+          import json, os
+          from firebase_admin import credentials, initialize_app, db
+          
+          cred = credentials.Certificate(json.loads(os.getenv('FIREBASE_TOKEN')))
+          initialize_app(cred, {'databaseURL': os.getenv('FIREBASE_URL')})
+          
+          with open('email_result.json') as f:
+              data = json.load(f)
+          
+          ref = db.reference('/emails')
+          ref.push(data)
+          print('Saved to Firebase successfully!')
+          "
 
   cancel-workflow:
     runs-on: ubuntu-latest
     if: github.event.inputs.action == 'cancel_workflow'
     
     steps:
-      - name: Cancel Running Workflows
-        uses: styfle/cancel-workflow-action@0.12.0
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.12.1
         with:
           workflow_id: ${{ github.workflow }}
           access_token: ${{ github.token }}
+      
+      - name: Cleanup Firebase
+        env:
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          python -c "
+          import json, os
+          from firebase_admin import credentials, initialize_app, db
+          
+          cred = credentials.Certificate(json.loads(os.getenv('FIREBASE_TOKEN')))
+          initialize_app(cred, {'databaseURL': os.getenv('FIREBASE_URL')})
+          
+          # Mark last email as cancelled
+          ref = db.reference('/emails')
+          last = ref.order_by_key().limit_to_last(1).get()
+          if last:
+              key = list(last.keys())[0]
+              ref.child(key).update({'status': 'cancelled'})
+          print('Cleanup done!')
+          "

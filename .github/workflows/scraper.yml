@@ -1,0 +1,87 @@
+name: Email Scraper Automation
+
+on:
+  # Manual trigger (Buy button click ke liye)
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'create_email'
+        type: choice
+        options:
+          - create_email
+          - check_otp
+          - cancel_workflow
+  
+  # Schedule bhi rakh sakta hai (optional)
+  # schedule:
+  #   - cron: '*/5 * * * *'
+
+jobs:
+  scrape-email:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run Scraper - Create Email
+        if: github.event.inputs.action == 'create_email' || github.event.inputs.action == ''
+        env:
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          python scraper.py > email_result.json
+          echo "EMAIL_RESULT=$(cat email_result.json)" >> $GITHUB_ENV
+      
+      - name: Check OTP
+        if: github.event.inputs.action == 'check_otp'
+        env:
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          python -c "
+          import requests, json, os, time
+          from bs4 import BeautifulSoup
+          
+          # Firebase se latest email lega
+          # Ye part tu customize karega apne logic se
+          print('Checking OTP...')
+          "
+      
+      - name: Upload Results
+        if: github.event.inputs.action == 'create_email'
+        uses: actions/upload-artifact@v3
+        with:
+          name: email-data
+          path: email_result.json
+      
+      - name: Save to Firebase
+        if: github.event.inputs.action == 'create_email'
+        run: |
+          # Firebase mein data push karega via REST API
+          curl -X POST \
+            "${{ secrets.FIREBASE_URL }}/emails.json?auth=${{ secrets.FIREBASE_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d @email_result.json || true
+
+  cancel-workflow:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'cancel_workflow'
+    
+    steps:
+      - name: Cancel Running Workflows
+        uses: styfle/cancel-workflow-action@0.12.0
+        with:
+          workflow_id: ${{ github.workflow }}
+          access_token: ${{ github.token }}

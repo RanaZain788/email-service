@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'Action to perform'
+        description: 'Action'
         required: true
         default: 'create_email'
         type: choice
@@ -15,41 +15,49 @@ on:
 
 jobs:
   scrape-email:
-    # ✅ Official Playwright Docker image
     runs-on: ubuntu-latest
-    container:
-      image: mcr.microsoft.com/playwright/python:v1.41.0-jammy
-      options: --user root
-    
     if: github.event.inputs.action != 'cancel_workflow'
     
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Chrome & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable unzip
+          google-chrome --version
       
       - name: Install Python Dependencies
         run: |
           pip install -r requirements.txt
       
-      - name: Run Scraper
-        id: scraper
+      - name: Run Scraper with Proxies
         env:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
           GITHUB_EVENT_INPUTS_ACTION: ${{ github.event.inputs.action }}
+          # 🔥 PROXIES YAHAN CONFIGURE KAR
+          PROXIES: ${{ secrets.PROXIES }}
+          # Ya individual proxies:
+          # HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          # HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          # SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
         run: |
           python scraper.py > result.json 2>&1 || true
           cat result.json
-          echo "result=$(cat result.json)" >> $GITHUB_OUTPUT
       
-      - name: Upload Results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: scraper-results
           path: |
             result.json
             debug_screenshot.png
+            proxy_auth_plugin.zip
           retention-days: 1
       
       - name: Save to Firebase
@@ -59,27 +67,20 @@ jobs:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
         run: |
           python -c "
-          import json, os, sys
+          import json, os
           try:
               from firebase_admin import credentials, initialize_app, db
-              
               with open('result.json') as f:
                   data = json.load(f)
-              
               if data.get('status') == 'active':
                   cred_info = json.loads(os.getenv('FIREBASE_TOKEN'))
                   if not initialize_app._apps:
                       cred = credentials.Certificate(cred_info)
                       initialize_app(cred, {'databaseURL': os.getenv('FIREBASE_URL')})
-                  
-                  ref = db.reference('/emails')
-                  ref.push(data)
-                  print('✅ Saved to Firebase!')
-              else:
-                  print('No active email to save')
+                  db.reference('/emails').push(data)
+                  print('Saved to Firebase!')
           except Exception as e:
-              print(f'Firebase error: {e}')
-              sys.exit(0)
+              print(f'Error: {e}')
           "
 
   cancel-workflow:
@@ -87,31 +88,6 @@ jobs:
     if: github.event.inputs.action == 'cancel_workflow'
     
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
+      - uses: styfle/cancel-workflow-action@0.12.1
         with:
           access_token: ${{ github.token }}
-      
-      - name: Mark Cancelled in Firebase
-        env:
-          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
-          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
-        run: |
-          python -c "
-          import json, os
-          try:
-              from firebase_admin import credentials, initialize_app, db
-              cred_info = json.loads(os.getenv('FIREBASE_TOKEN'))
-              if not initialize_app._apps:
-                  cred = credentials.Certificate(cred_info)
-                  initialize_app(cred, {'databaseURL': os.getenv('FIREBASE_URL')})
-              
-              ref = db.reference('/emails')
-              last = ref.order_by_key().limit_to_last(1).get()
-              if last:
-                  key = list(last.keys())[0]
-                  ref.child(key).update({'status': 'cancelled'})
-                  print('Marked as cancelled')
-          except Exception as e:
-              print(f'Error: {e}')
-          "

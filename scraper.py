@@ -3,7 +3,9 @@ from bs4 import BeautifulSoup
 import json
 import re
 import os
+import sys
 from datetime import datetime
+import time
 
 class EmailScraper:
     def __init__(self):
@@ -11,134 +13,186 @@ class EmailScraper:
         self.session = requests.Session()
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
         }
         
     def get_temp_email(self):
-        """TempMail.Ninja se naya email lega"""
+        """TempMail.Ninja se naya email fetch karega"""
         try:
-            # Pehle homepage se email fetch karega
-            response = self.session.get(self.base_url, headers=self.headers, timeout=30)
+            print("Fetching email from TempMail.Ninja...", file=sys.stderr)
             
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
+            # Step 1: Homepage se email lega
+            response = self.session.get(
+                self.base_url, 
+                headers=self.headers, 
+                timeout=30,
+                allow_redirects=True
+            )
+            
+            print(f"Response status: {response.status_code}", file=sys.stderr)
+            
+            if response.status_code != 200:
+                return {
+                    'error': f'HTTP {response.status_code}',
+                    'status': 'failed',
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            # Step 2: Parse HTML
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Multiple selectors try karega email ke liye
+            email_selectors = [
+                'span.main-email',
+                '[class*="email"]',
+                '[class*="mail"]',
+                'span[class*="main"]'
+            ]
+            
+            email = None
+            
+            for selector in email_selectors:
+                element = soup.select_one(selector)
+                if element:
+                    text = element.get_text(strip=True)
+                    # Email validation regex
+                    if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', text):
+                        email = text
+                        print(f"Found email with selector: {selector}", file=sys.stderr)
+                        break
+            
+            if not email:
+                # Fallback: Pure text mein email dhoondhega
+                text_content = soup.get_text()
+                emails_found = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', text_content)
+                if emails_found:
+                    email = emails_found[0]
+                    print(f"Found email in text: {email}", file=sys.stderr)
+            
+            if email:
+                return {
+                    'email': email,
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'active',
+                    'source': 'tempmail.ninja',
+                    'workflow_id': os.getenv('GITHUB_RUN_ID', 'local')
+                }
+            else:
+                return {
+                    'error': 'No email found on page',
+                    'status': 'failed',
+                    'timestamp': datetime.now().isoformat(),
+                    'html_snippet': response.text[:500]  # Debug ke liye
+                }
                 
-                # Email dhoondhega - class name check karega
-                email_span = soup.find('span', class_='main-email')
-                
-                if email_span:
-                    email = email_span.get_text(strip=True)
-                    # Email validation
-                    if re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email):
-                        return {
-                            'email': email,
-                            'timestamp': datetime.now().isoformat(),
-                            'status': 'active',
-                            'source': 'tempmail.ninja'
-                        }
-            
-            return None
-            
+        except requests.exceptions.Timeout:
+            return {
+                'error': 'Request timeout',
+                'status': 'failed',
+                'timestamp': datetime.now().isoformat()
+            }
         except Exception as e:
-            print(f"Error fetching email: {str(e)}")
-            return None
+            return {
+                'error': str(e),
+                'status': 'failed',
+                'timestamp': datetime.now().isoformat()
+            }
     
     def check_inbox(self, email):
-        """Email ka inbox check karega OTP ke liye"""
+        """Email inbox check karega OTP ke liye"""
         try:
-            # TempMail API ya inbox page se check karega
-            inbox_url = f"{self.base_url}/api/inbox/{email}"
+            # TempMail ka inbox URL
+            inbox_url = f"{self.base_url}/inbox/{email}"
             
-            response = self.session.get(inbox_url, headers=self.headers, timeout=30)
+            response = self.session.get(
+                inbox_url,
+                headers=self.headers,
+                timeout=30
+            )
             
-            if response.status_code == 200:
-                data = response.json()
+            if response.status_code != 200:
+                return {'otp_found': False, 'error': f'HTTP {response.status_code}'}
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Messages dhoondhega
+            messages = []
+            message_elements = soup.find_all(['div', 'tr'], class_=re.compile(r'message|email|inbox'))
+            
+            for msg in message_elements:
+                subject = msg.find(class_=re.compile(r'subject|title'))
+                body = msg.find(class_=re.compile(r'body|content|text'))
                 
-                # OTP wala email dhoondhega
-                for message in data.get('messages', []):
-                    subject = message.get('subject', '').lower()
-                    body = message.get('body', '').lower()
-                    
-                    # OTP patterns check karega
-                    otp_patterns = [
-                        r'\b\d{4,8}\b',  # 4-8 digit numbers
-                        r'otp[\s:]+(\d+)',
-                        r'code[\s:]+(\d+)',
-                        r'verification[\s:]+(\d+)',
-                        r'confirm[\s:]+(\d+)'
-                    ]
-                    
-                    for pattern in otp_patterns:
-                        match = re.search(pattern, subject + ' ' + body)
-                        if match:
-                            return {
-                                'otp_found': True,
-                                'otp': match.group(1),
-                                'sender': message.get('from', ''),
-                                'subject': message.get('subject', ''),
-                                'timestamp': datetime.now().isoformat()
-                            }
+                subject_text = subject.get_text(strip=True) if subject else ''
+                body_text = body.get_text(strip=True) if body else ''
                 
-                return {'otp_found': False, 'messages': len(data.get('messages', []))}
-            
-            return {'otp_found': False, 'error': 'Failed to check inbox'}
-            
-        except Exception as e:
-            print(f"Error checking inbox: {str(e)}")
-            return {'otp_found': False, 'error': str(e)}
-    
-    def save_to_firebase(self, data, firebase_url, firebase_token):
-        """Firebase Realtime Database mein save karega"""
-        try:
-            import firebase_admin
-            from firebase_admin import credentials, db
-            
-            # Firebase initialize (agar pehle se nahi hua)
-            if not firebase_admin._apps:
-                cred = credentials.Certificate(firebase_token)
-                firebase_admin.initialize_app(cred, {
-                    'databaseURL': firebase_url
+                # OTP patterns check karega
+                full_text = f"{subject_text} {body_text}"
+                
+                # Common OTP patterns
+                otp_patterns = [
+                    r'\b\d{4}\b',      # 4 digit
+                    r'\b\d{5}\b',      # 5 digit  
+                    r'\b\d{6}\b',      # 6 digit
+                    r'\b\d{8}\b',      # 8 digit
+                    r'OTP[:\s]+(\d+)',
+                    r'CODE[:\s]+(\d+)',
+                    r'VERIFICATION[:\s]+(\d+)',
+                ]
+                
+                for pattern in otp_patterns:
+                    match = re.search(pattern, full_text, re.IGNORECASE)
+                    if match:
+                        otp = match.group(1) if match.groups() else match.group(0)
+                        return {
+                            'otp_found': True,
+                            'otp': otp,
+                            'sender': subject_text[:50],
+                            'subject': subject_text,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                
+                messages.append({
+                    'subject': subject_text,
+                    'body_preview': body_text[:100]
                 })
             
-            ref = db.reference('/emails')
-            ref.push(data)
-            
-            return True
+            return {
+                'otp_found': False,
+                'messages_count': len(messages),
+                'messages': messages[:3]  # Last 3 messages
+            }
             
         except Exception as e:
-            print(f"Firebase error: {str(e)}")
-            # Fallback: JSON file mein save karega
-            self._save_local(data)
-            return False
-    
-    def _save_local(self, data):
-        """Local JSON file mein backup save karega"""
-        try:
-            with open('emails_data.json', 'a') as f:
-                json.dump(data, f)
-                f.write('\n')
-        except:
-            pass
+            return {
+                'otp_found': False,
+                'error': str(e)
+            }
 
 # Main execution
 if __name__ == "__main__":
     scraper = EmailScraper()
     
-    # Email fetch karega
-    email_data = scraper.get_temp_email()
+    # Action decide karega
+    action = os.getenv('GITHUB_EVENT_INPUTS_ACTION', 'create_email')
     
-    if email_data:
-        print(json.dumps(email_data, indent=2))
-        
-        # Firebase mein save karega (env variables se)
-        firebase_url = os.getenv('FIREBASE_URL')
-        firebase_token = os.getenv('FIREBASE_TOKEN')
-        
-        if firebase_url and firebase_token:
-            scraper.save_to_firebase(email_data, firebase_url, firebase_token)
+    if action == 'check_otp':
+        email = os.getenv('EMAIL_ID', '')
+        if email:
+            result = scraper.check_inbox(email)
+        else:
+            result = {'error': 'No email provided for OTP check'}
     else:
-        print(json.dumps({'error': 'Failed to get email', 'status': 'failed'}))
+        # Default: Create email
+        result = scraper.get_temp_email()
+    
+    # JSON output
+    print(json.dumps(result, indent=2))
